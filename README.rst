@@ -1,3 +1,36 @@
+Setup Ryu SDN
+==========
+
+Check python version::
+   % python --version
+   # Python 3.9.24
+
+Create venv::
+   % python -m venv .venv
+
+Activate::
+   % . .venv/bin/activate
+
+Install dependencies::
+   % pip install -r pip-requirements.txt
+
+Build::
+   % pip install .
+
+Run Ryu SDN:
+   % ryu-manager mininet/ryu_project.py
+
+
+Run Mininet:
+==========
+
+Dependencies:
+- Make sure that Mininet is installed on the OS
+- Make sure that you can use mininet libraries with host python installation
+
+Run with command::
+   % /usr/bin/python3 mininet/topology.py
+
 **PLEASE READ: RYU NOT CURRENTLY MAINTAINED**
 
     * The Ryu project needs new maintainers - please file an issue if you are able to assist.

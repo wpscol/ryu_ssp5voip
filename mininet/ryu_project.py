@@ -1,5 +1,4 @@
 from ryu.app import simple_switch_stp_13
-from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, set_ev_cls
 from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp
 from ryu.lib import stplib
@@ -9,7 +8,6 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
     def __init__(self, *args, **kwargs):
         super(STP_Switch, self).__init__(*args, **kwargs)
 
-    # We must override the handler to add Layer 4 (Port) matching logic
     @set_ev_cls(stplib.EventPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
@@ -38,7 +36,6 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # --- MODIFICATION START: Install Flow with L4 Matching ---
         if out_port != ofproto.OFPP_FLOOD:
 
             # 1. Base Match (Layer 2)
@@ -68,9 +65,8 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             match = parser.OFPMatch(**match_fields)
             self.add_flow(datapath, 1, match, actions, msg.buffer_id)
             return
-        # --- MODIFICATION END ---
 
-        # If we didn't install a flow (flood), simply send the packet out
+        # If didn't install a flow (flood), simply send the packet out
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data

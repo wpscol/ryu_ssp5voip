@@ -12,6 +12,7 @@ GPATH
 GSYMS
 *.log
 .venv/
+.venv*
 .tox/
 .coverage
 covhtml/
