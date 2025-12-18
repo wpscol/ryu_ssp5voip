@@ -18,6 +18,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         self.voip_active = False
         self.flows_to_migrate = []
         self.migration_in_progress = False
+        self.voip_stats_check_in_progress = False
         self.rr_counter = 0  # Round-robin counter for load balancing
 
         # Start VoIP timeout monitoring thread
@@ -89,15 +90,17 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
                 # Path 2: s1→s5→s6→s2
                 return ("s5", [1, 5, 6, 2], [(1, 4), (5, 2), (6, 2), (2, 2)])
 
-    def _install_tcp_flow_on_path(self, pkt, path_name, switches, ports):
+    def _install_tcp_flow_on_path(self, pkt, path_name, switches, ports, datapath, in_port):
         """
-        Install TCP flow on the specified path.
+        Install TCP flow on the specified path bidirectionally.
 
         Args:
             pkt: packet object
             path_name: name of the path (for logging)
             switches: list of switch IDs in the path
             ports: list of (switch_id, out_port) tuples
+            datapath: datapath that received the packet
+            in_port: input port where packet was received
         """
 
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
@@ -109,7 +112,34 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         priority = 1
         idle_timeout = 1  # Flows expire after 1 second of inactivity
 
-        # Forward direction: h1 → h2
+        dpid = datapath.id
+
+        # Determine direction and normalize IPs to h1→h2
+        # h1 connects to s1 port 1, h2 connects to s2 port 2
+        if dpid == 1 and in_port == 1:
+            # Packet from h1 to h2
+            h1_to_h2_src = ip_pkt.src
+            h1_to_h2_dst = ip_pkt.dst
+            h1_to_h2_tcp_src = tcp_pkt.src_port
+            h1_to_h2_tcp_dst = tcp_pkt.dst_port
+            direction = "h1->h2"
+        elif dpid == 2 and in_port == 2:
+            # Packet from h2 to h1: swap src/dst to normalize to h1→h2
+            h1_to_h2_src = ip_pkt.dst
+            h1_to_h2_dst = ip_pkt.src
+            h1_to_h2_tcp_src = tcp_pkt.dst_port
+            h1_to_h2_tcp_dst = tcp_pkt.src_port
+            direction = "h2->h1"
+        else:
+            # Unexpected location, use packet as-is
+            self.logger.warning(f"TCP packet from unexpected location: dpid={dpid}, in_port={in_port}")
+            h1_to_h2_src = ip_pkt.src
+            h1_to_h2_dst = ip_pkt.dst
+            h1_to_h2_tcp_src = tcp_pkt.src_port
+            h1_to_h2_tcp_dst = tcp_pkt.dst_port
+            direction = "unknown"
+
+        # Forward direction: h1 → h2 (via s1→path→s2)
         for i, (sw_id, out_port) in enumerate(ports):
             dp = self.datapaths.get(sw_id)
             if not dp:
@@ -121,11 +151,11 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
 
             match = parser.OFPMatch(
                 eth_type=0x0800,
-                ipv4_src=ip_pkt.src,
-                ipv4_dst=ip_pkt.dst,
+                ipv4_src=h1_to_h2_src,
+                ipv4_dst=h1_to_h2_dst,
                 ip_proto=6,
-                tcp_src=tcp_pkt.src_port,
-                tcp_dst=tcp_pkt.dst_port
+                tcp_src=h1_to_h2_tcp_src,
+                tcp_dst=h1_to_h2_tcp_dst
             )
             actions = [parser.OFPActionOutput(out_port)]
             inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -140,13 +170,8 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             )
             dp.send_msg(mod)
 
-        # Reverse direction: h2 → h1
-        # Reverse the path
-        reverse_ports = list(reversed([(switches[i], ports[i-1][1] if i > 0 else 1)
-                                       for i in range(len(ports))]))
-
-        # For reverse, we need to determine input ports
-        # s2→s6/s4/s3, then back to s1
+        # Reverse direction: h2 → h1 (via s2→path→s1)
+        # For reverse, we need to determine the correct ports
         if path_name == "s3":
             # Reverse: s2(port 1)→s3(port 1)→s1(port 1)
             reverse_path = [(2, 1), (3, 1), (1, 1)]
@@ -167,11 +192,11 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
 
             match = parser.OFPMatch(
                 eth_type=0x0800,
-                ipv4_src=ip_pkt.dst,
-                ipv4_dst=ip_pkt.src,
+                ipv4_src=h1_to_h2_dst,
+                ipv4_dst=h1_to_h2_src,
                 ip_proto=6,
-                tcp_src=tcp_pkt.dst_port,
-                tcp_dst=tcp_pkt.src_port
+                tcp_src=h1_to_h2_tcp_dst,
+                tcp_dst=h1_to_h2_tcp_src
             )
             actions = [parser.OFPActionOutput(out_port)]
             inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -187,26 +212,46 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             dp.send_msg(mod)
 
         self.logger.info(
-            f"Round-robin: Installed TCP flow {ip_pkt.src}:{tcp_pkt.src_port} → "
-            f"{ip_pkt.dst}:{tcp_pkt.dst_port} on path {path_name} (counter={self.rr_counter})"
+            f"Round-robin: Installed TCP flow {h1_to_h2_src}:{h1_to_h2_tcp_src} ↔ "
+            f"{h1_to_h2_dst}:{h1_to_h2_tcp_dst} on path {path_name} (detected: {direction}, counter={self.rr_counter})"
         )
 
         return True
 
     def _monitor_voip_timeout(self):
-        """Background thread to monitor VoIP activity and remove rules after timeout"""
+        """Background thread to monitor VoIP activity and poll for VoIP flows"""
         while True:
-            hub.sleep(1)  # Check every second
+            hub.sleep(3)  # Poll every 3 seconds
 
-            if self.voip_active and self.last_voip_time:
-                elapsed = time.time() - self.last_voip_time
-                if elapsed > VOIP_TIMEOUT:
-                    self.logger.info(
-                        f"No VoIP traffic for {VOIP_TIMEOUT}s - removing VoIP rules"
+            # Poll s3 for VoIP flow statistics
+            if self.voip_active:
+                s3_dp = self.datapaths.get(3)
+                if s3_dp:
+                    self.voip_stats_check_in_progress = True
+
+                    ofproto = s3_dp.ofproto
+                    parser = s3_dp.ofproto_parser
+
+                    # Request UDP flows with priority 100 (VoIP flows)
+                    match = parser.OFPMatch(eth_type=0x0800, ip_proto=17)  # UDP
+                    req = parser.OFPFlowStatsRequest(
+                        s3_dp, 0, ofproto.OFPTT_ALL,
+                        ofproto.OFPP_ANY, ofproto.OFPG_ANY,
+                        0, 0, match
                     )
-                    self.remove_voip_rules()
-                    self.voip_active = False
-                    self.last_voip_time = None
+                    s3_dp.send_msg(req)
+                    self.logger.debug("Polling s3 for VoIP flow statistics")
+
+                # Check timeout if we have a last_voip_time
+                if self.last_voip_time:
+                    elapsed = time.time() - self.last_voip_time
+                    if elapsed > VOIP_TIMEOUT:
+                        self.logger.info(
+                            f"No VoIP traffic for {VOIP_TIMEOUT}s - removing VoIP rules"
+                        )
+                        self.remove_voip_rules()
+                        self.voip_active = False
+                        self.last_voip_time = None
 
     def remove_voip_rules(self):
         """Remove VoIP-specific flows, restore normal operation"""
@@ -261,16 +306,36 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        """Handle flow stats reply and migrate flows to alternative path"""
-
-        if not self.migration_in_progress:
-            return
+        """Handle flow stats reply for both migration and VoIP monitoring"""
 
         body = ev.msg.body
         datapath = ev.msg.datapath
 
         # Only process replies from s3
         if datapath.id != 3:
+            return
+
+        # Handle VoIP statistics polling
+        if self.voip_stats_check_in_progress:
+            self.voip_stats_check_in_progress = False
+
+            # Count VoIP flows (priority 100, UDP)
+            voip_flow_count = 0
+            for stat in body:
+                if stat.priority == 100:  # VoIP flows have priority 100
+                    voip_flow_count += 1
+
+            if voip_flow_count > 0:
+                # VoIP flows found - update timestamp
+                self.last_voip_time = time.time()
+                self.logger.debug(f"Found {voip_flow_count} active VoIP flows on s3, updating timestamp")
+            else:
+                self.logger.debug("No active VoIP flows found on s3")
+
+            return
+
+        # Handle TCP flow migration
+        if not self.migration_in_progress:
             return
 
         self.logger.info(f"Received {len(body)} flow entries from s3")
@@ -450,8 +515,8 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
 
         self.logger.info(f"Deleted {len(self.flows_to_migrate)} flows from optimal path (s1, s3, s2)")
 
-    def install_voip_path(self, pkt, src_mac, dst_mac):
-        """Install VoIP flows on optimal path: s1 -> s3 -> s2"""
+    def install_voip_path(self, pkt, src_mac, dst_mac, datapath, in_port):
+        """Install VoIP flows on optimal path bidirectionally"""
 
         # Get switch datapaths from stored dictionary
         s1_dp = self.datapaths.get(1)
@@ -469,78 +534,173 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             return
 
         priority = 100
+        idle_timeout = 5  # VoIP flows expire after 5 seconds of inactivity
 
+        dpid = datapath.id
+
+        # Determine direction based on which switch received the packet
+        # h1 connects to s1 port 1, h2 connects to s2 port 2
+
+        if dpid == 1 and in_port == 1:
+            # Packet from h1 to h2: install h1_ip -> h2_ip via s1->s3->s2
+            h1_to_h2_src = ip_pkt.src
+            h1_to_h2_dst = ip_pkt.dst
+            h1_to_h2_udp_src = udp_pkt.src_port
+            h1_to_h2_udp_dst = udp_pkt.dst_port
+            direction = "h1->h2"
+        elif dpid == 2 and in_port == 2:
+            # Packet from h2 to h1: install h2_ip -> h1_ip via s2->s3->s1
+            # Swap src/dst so h1_to_h2 variables represent h1->h2 direction
+            h1_to_h2_src = ip_pkt.dst
+            h1_to_h2_dst = ip_pkt.src
+            h1_to_h2_udp_src = udp_pkt.dst_port
+            h1_to_h2_udp_dst = udp_pkt.src_port
+            direction = "h2->h1"
+        else:
+            # Packet arrived from unexpected location, install generically
+            # Assume src is trying to reach dst
+            self.logger.warning(f"VoIP packet from unexpected location: dpid={dpid}, in_port={in_port}")
+            h1_to_h2_src = ip_pkt.src
+            h1_to_h2_dst = ip_pkt.dst
+            h1_to_h2_udp_src = udp_pkt.src_port
+            h1_to_h2_udp_dst = udp_pkt.dst_port
+            direction = "unknown"
+
+        # Install flows for h1 -> h2 direction (via s1->s3->s2)
         # S1: Forward to s3 (port 2)
         match = s1_dp.ofproto_parser.OFPMatch(
             eth_type=0x0800,
-            ipv4_src=ip_pkt.src,
-            ipv4_dst=ip_pkt.dst,
+            ipv4_src=h1_to_h2_src,
+            ipv4_dst=h1_to_h2_dst,
             ip_proto=17,
-            udp_src=udp_pkt.src_port,
-            udp_dst=udp_pkt.dst_port,
+            udp_src=h1_to_h2_udp_src,
+            udp_dst=h1_to_h2_udp_dst,
         )
         actions = [s1_dp.ofproto_parser.OFPActionOutput(2)]
-        self.add_flow(s1_dp, priority, match, actions)
+        inst = [s1_dp.ofproto_parser.OFPInstructionActions(
+            s1_dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = s1_dp.ofproto_parser.OFPFlowMod(
+            datapath=s1_dp,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0
+        )
+        s1_dp.send_msg(mod)
 
         # S3: Forward to s2 (port 2)
         match = s3_dp.ofproto_parser.OFPMatch(
             eth_type=0x0800,
-            ipv4_src=ip_pkt.src,
-            ipv4_dst=ip_pkt.dst,
+            ipv4_src=h1_to_h2_src,
+            ipv4_dst=h1_to_h2_dst,
             ip_proto=17,
-            udp_src=udp_pkt.src_port,
-            udp_dst=udp_pkt.dst_port,
+            udp_src=h1_to_h2_udp_src,
+            udp_dst=h1_to_h2_udp_dst,
         )
         actions = [s3_dp.ofproto_parser.OFPActionOutput(2)]
-        self.add_flow(s3_dp, priority, match, actions)
+        inst = [s3_dp.ofproto_parser.OFPInstructionActions(
+            s3_dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = s3_dp.ofproto_parser.OFPFlowMod(
+            datapath=s3_dp,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0
+        )
+        s3_dp.send_msg(mod)
 
         # S2: Forward to h2 (port 2)
         match = s2_dp.ofproto_parser.OFPMatch(
             eth_type=0x0800,
-            ipv4_src=ip_pkt.src,
-            ipv4_dst=ip_pkt.dst,
+            ipv4_src=h1_to_h2_src,
+            ipv4_dst=h1_to_h2_dst,
             ip_proto=17,
-            udp_src=udp_pkt.src_port,
-            udp_dst=udp_pkt.dst_port,
+            udp_src=h1_to_h2_udp_src,
+            udp_dst=h1_to_h2_udp_dst,
         )
         actions = [s2_dp.ofproto_parser.OFPActionOutput(2)]
-        self.add_flow(s2_dp, priority, match, actions)
+        inst = [s2_dp.ofproto_parser.OFPInstructionActions(
+            s2_dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = s2_dp.ofproto_parser.OFPFlowMod(
+            datapath=s2_dp,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0
+        )
+        s2_dp.send_msg(mod)
 
-        # REVERSE PATH
+        # Install flows for h2 -> h1 direction (via s2->s3->s1)
+        # S2: Forward to s3 (port 1)
         match = s2_dp.ofproto_parser.OFPMatch(
             eth_type=0x0800,
-            ipv4_src=ip_pkt.dst,
-            ipv4_dst=ip_pkt.src,
+            ipv4_src=h1_to_h2_dst,
+            ipv4_dst=h1_to_h2_src,
             ip_proto=17,
-            udp_src=udp_pkt.dst_port,
-            udp_dst=udp_pkt.src_port,
+            udp_src=h1_to_h2_udp_dst,
+            udp_dst=h1_to_h2_udp_src,
         )
         actions = [s2_dp.ofproto_parser.OFPActionOutput(1)]
-        self.add_flow(s2_dp, priority, match, actions)
+        inst = [s2_dp.ofproto_parser.OFPInstructionActions(
+            s2_dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = s2_dp.ofproto_parser.OFPFlowMod(
+            datapath=s2_dp,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0
+        )
+        s2_dp.send_msg(mod)
 
+        # S3: Forward to s1 (port 1)
         match = s3_dp.ofproto_parser.OFPMatch(
             eth_type=0x0800,
-            ipv4_src=ip_pkt.dst,
-            ipv4_dst=ip_pkt.src,
+            ipv4_src=h1_to_h2_dst,
+            ipv4_dst=h1_to_h2_src,
             ip_proto=17,
-            udp_src=udp_pkt.dst_port,
-            udp_dst=udp_pkt.src_port,
+            udp_src=h1_to_h2_udp_dst,
+            udp_dst=h1_to_h2_udp_src,
         )
         actions = [s3_dp.ofproto_parser.OFPActionOutput(1)]
-        self.add_flow(s3_dp, priority, match, actions)
+        inst = [s3_dp.ofproto_parser.OFPInstructionActions(
+            s3_dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = s3_dp.ofproto_parser.OFPFlowMod(
+            datapath=s3_dp,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0
+        )
+        s3_dp.send_msg(mod)
 
+        # S1: Forward to h1 (port 1)
         match = s1_dp.ofproto_parser.OFPMatch(
             eth_type=0x0800,
-            ipv4_src=ip_pkt.dst,
-            ipv4_dst=ip_pkt.src,
+            ipv4_src=h1_to_h2_dst,
+            ipv4_dst=h1_to_h2_src,
             ip_proto=17,
-            udp_src=udp_pkt.dst_port,
-            udp_dst=udp_pkt.src_port,
+            udp_src=h1_to_h2_udp_dst,
+            udp_dst=h1_to_h2_udp_src,
         )
         actions = [s1_dp.ofproto_parser.OFPActionOutput(1)]
-        self.add_flow(s1_dp, priority, match, actions)
+        inst = [s1_dp.ofproto_parser.OFPInstructionActions(
+            s1_dp.ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = s1_dp.ofproto_parser.OFPFlowMod(
+            datapath=s1_dp,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0
+        )
+        s1_dp.send_msg(mod)
 
-        self.logger.info("VoIP path installed: s1->s3->s2")
+        self.logger.info(f"VoIP path installed bidirectionally (detected: {direction}) with 5s idle timeout")
 
     def block_nonvoip_on_optimal_path(self):
         """Block non-VoIP traffic from using optimal path s1->s3->s2 and setup alternative path"""
@@ -639,7 +799,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
                 self.logger.info("VoIP detected! Installing optimal path")
                 self.voip_active = True
                 self.migrate_tcp_flows_to_alternative_path()
-                self.install_voip_path(pkt, src, dst)
+                self.install_voip_path(pkt, src, dst, datapath, in_port)
                 # Note: Round-robin handles path selection, no need for catch-all blocking
             else:
                 # VoIP already active - just update timestamp
@@ -665,17 +825,30 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        # Use round-robin for TCP flows originating from s1
-        if tcp_pkt and ip_pkt and dpid == 1 and in_port == 1:  # From h1 on s1
+        # Use round-robin for TCP flows from h1 or h2
+        if tcp_pkt and ip_pkt and ((dpid == 1 and in_port == 1) or (dpid == 2 and in_port == 2)):
             # Choose path using round-robin
             path_name, switches, ports = self._choose_path_round_robin()
 
             # Install flow on the entire chosen path
-            if self._install_tcp_flow_on_path(pkt, path_name, switches, ports):
+            if self._install_tcp_flow_on_path(pkt, path_name, switches, ports, datapath, in_port):
                 self.rr_counter += 1  # Increment counter after successful installation
 
-                # Send this packet via the chosen path
-                out_port = ports[0][1]  # First hop output port
+                # Determine output port based on which host sent the packet
+                if dpid == 1 and in_port == 1:
+                    # Packet from h1: use forward path first hop
+                    out_port = ports[0][1]  # First hop output port
+                elif dpid == 2 and in_port == 2:
+                    # Packet from h2: use reverse path first hop
+                    if path_name == "s3":
+                        out_port = 1  # s2 → s3
+                    elif path_name == "s4":
+                        out_port = 3  # s2 → s4
+                    else:  # s5
+                        out_port = 4  # s2 → s6
+                else:
+                    out_port = ofproto.OFPP_FLOOD
+
                 actions = [parser.OFPActionOutput(out_port)]
                 data = None
                 if msg.buffer_id == ofproto.OFP_NO_BUFFER:
