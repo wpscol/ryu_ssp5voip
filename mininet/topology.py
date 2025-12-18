@@ -45,21 +45,22 @@ def configure_tc(net):
 
 
 def start_traffic(net):
-    """Starts permanent traffic generation between hosts."""
+    """Starts bursty traffic generation between hosts."""
     h1 = net.get("h1")
     h2 = net.get("h2")
 
     srv_ip = h2.IP()
+    transfer_bytes = 3 * 1024 * 1024  # 3 MB in bytes
 
     info(f"*** Starting iperf SERVERS on {h2.name} ({srv_ip})...\n")
     h2.cmd("iperf -s -p 4001 &")
     h2.cmd("iperf -s -p 4002 &")
-    # h2.cmd("iperf -s -u -p 5003 &")
 
-    info(f"*** Starting iperf CLIENTS on {h1.name} connecting to {h2.name}...\n")
-    h1.cmd(f"iperf -c {srv_ip} -p 4001 -t 99999 &")
-    h1.cmd(f"iperf -c {srv_ip} -p 4002 -t 99999 &")
-    # h1.cmd(f"iperf -c {srv_ip} -p 5003 -u -t 99999 &")
+    info(f"*** Starting bursty iperf CLIENTS on {h1.name}...\n")
+    # Generator a: wait 5s, transfer 3MB, repeat
+    h1.cmd(f"while true; do sleep 5; iperf -c {srv_ip} -p 4001 -n {transfer_bytes}; done &")
+    # Generator b: wait 2s, transfer 3MB, repeat
+    h1.cmd(f"while true; do sleep 2; iperf -c {srv_ip} -p 4002 -n {transfer_bytes}; done &")
 
 
 def main():
@@ -77,7 +78,7 @@ def main():
     info("\n*** Waiting 45 seconds for STP to converge...\n")
     sleep(45)
 
-    # start_traffic(net)
+    start_traffic(net)
 
     CLI(net)
     net.stop()
