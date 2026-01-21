@@ -2,6 +2,7 @@
 
 from logging import getLogger
 from time import sleep
+import random
 
 from mininet.topo import Topo
 from mininet.net import Mininet
@@ -45,22 +46,49 @@ def configure_tc(net):
 
 
 def start_traffic(net):
-    """Starts bursty traffic generation between hosts."""
+    """Starts realistic bursty traffic generation between hosts with random patterns."""
     h1 = net.get("h1")
     h2 = net.get("h2")
 
     srv_ip = h2.IP()
-    transfer_bytes = 3 * 1024 * 1024  # 3 MB in bytes
 
     info(f"*** Starting iperf SERVERS on {h2.name} ({srv_ip})...\n")
     h2.cmd("iperf -s -p 4001 &")
     h2.cmd("iperf -s -p 4002 &")
+    h2.cmd("iperf -s -p 4003 &")
+    h2.cmd("iperf -s -p 4004 &")
 
-    info(f"*** Starting bursty iperf CLIENTS on {h1.name}...\n")
-    # Generator a: wait 5s, transfer 3MB, repeat
-    h1.cmd(f"while true; do sleep 5; iperf -c {srv_ip} -p 4001 -n {transfer_bytes}; done &")
-    # Generator b: wait 2s, transfer 3MB, repeat
-    h1.cmd(f"while true; do sleep 2; iperf -c {srv_ip} -p 4002 -n {transfer_bytes}; done &")
+    info(f"*** Starting realistic bursty iperf CLIENTS on {h1.name}...\n")
+
+    # Generator 1: Frequent small bursts simulating API calls (50-200 KB every 0.5-2 seconds)
+    h1.cmd(f"""bash -c 'while true; do
+        sleep $(awk "BEGIN {{print (RANDOM % 15 + 5) / 10}}");
+        size=$((50 + RANDOM % 151))K;
+        iperf -c {srv_ip} -p 4001 -n $size;
+    done' &""")
+
+    # Generator 2: Very frequent tiny bursts simulating messaging (10-50 KB every 0.3-1 second)
+    h1.cmd(f"""bash -c 'while true; do
+        sleep $(awk "BEGIN {{print (RANDOM % 7 + 3) / 10}}");
+        size=$((10 + RANDOM % 41))K;
+        iperf -c {srv_ip} -p 4002 -n $size;
+    done' &""")
+
+    # Generator 3: Frequent medium bursts simulating web pages (100-400 KB every 1-3 seconds)
+    h1.cmd(f"""bash -c 'while true; do
+        sleep $((1 + RANDOM % 3));
+        size=$((100 + RANDOM % 301))K;
+        iperf -c {srv_ip} -p 4003 -n $size;
+    done' &""")
+
+    # Generator 4: Medium-frequent bursts simulating streaming chunks (200-800 KB every 1-4 seconds)
+    h1.cmd(f"""bash -c 'while true; do
+        sleep $((1 + RANDOM % 4));
+        size=$((200 + RANDOM % 601))K;
+        iperf -c {srv_ip} -p 4004 -n $size;
+    done' &""")
+
+    info("*** Traffic generators started with random burst patterns\n")
 
 
 def main():

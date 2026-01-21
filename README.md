@@ -64,6 +64,11 @@ Run Ryu SDN:
 % ryu-manager mininet/ryu_project.py
 ```
 
+Run Ryu SDN with verbose logging:
+```bash
+% VOIP_VERBOSE=1 ryu-manager mininet/ryu_project.py
+```
+
 ## Run Mininet
 
 Dependencies:

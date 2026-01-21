@@ -5,6 +5,14 @@ from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp
 from ryu.lib import stplib, hub
 from ryu.ofproto import ofproto_v1_3
 import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Reduce STP logging verbosity
+stp_logger = logging.getLogger('ryu.lib.stplib')
+stp_logger.setLevel(logging.WARNING)
 
 IDLE_TIMEOUT: int = 30
 VOIP_TIMEOUT: int = 10  # Remove VoIP rules after 10 seconds of no VoIP traffic
@@ -110,7 +118,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             return False
 
         priority = 1
-        idle_timeout = 1  # Flows expire after 1 second of inactivity
+        idle_timeout = 5  # Flows expire after 1 second of inactivity
 
         dpid = datapath.id
 
@@ -240,13 +248,13 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
                         0, 0, match
                     )
                     s3_dp.send_msg(req)
-                    self.logger.debug("Polling s3 for VoIP flow statistics")
+                    self.logger.debug("Polling s3 for VoIP flow statistics...")
 
                 # Check timeout if we have a last_voip_time
                 if self.last_voip_time:
                     elapsed = time.time() - self.last_voip_time
                     if elapsed > VOIP_TIMEOUT:
-                        self.logger.info(
+                        self.logger.warning(
                             f"No VoIP traffic for {VOIP_TIMEOUT}s - removing VoIP rules"
                         )
                         self.remove_voip_rules()
@@ -287,7 +295,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         s3_dp = self.datapaths.get(3)
 
         if not s3_dp:
-            self.logger.warning("Cannot migrate flows: s3 not ready yet")
+            self.logger.error("Cannot migrate flows: s3 not ready yet")
             return
 
         # Request flow stats from s3 for TCP flows
@@ -302,7 +310,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         req = parser.OFPFlowStatsRequest(s3_dp, 0, ofproto.OFPTT_ALL, ofproto.OFPP_ANY, ofproto.OFPG_ANY, 0, 0, match)
         s3_dp.send_msg(req)
 
-        self.logger.info("Requested TCP flow stats from s3 for migration")
+        self.logger.debug("Requested TCP flow stats from s3 for migration")
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
@@ -328,7 +336,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             if voip_flow_count > 0:
                 # VoIP flows found - update timestamp
                 self.last_voip_time = time.time()
-                self.logger.debug(f"Found {voip_flow_count} active VoIP flows on s3, updating timestamp")
+                self.logger.debug(f"Found {voip_flow_count} active VoIP flow(s) on s3, updating timestamp")
             else:
                 self.logger.debug("No active VoIP flows found on s3")
 
@@ -338,7 +346,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         if not self.migration_in_progress:
             return
 
-        self.logger.info(f"Received {len(body)} flow entries from s3")
+        self.logger.debug(f"Received {len(body)} flow entries from s3")
 
         # Parse TCP flows
         for stat in body:
@@ -358,7 +366,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
                     'in_port': match.get('in_port')
                 }
                 self.flows_to_migrate.append(flow_info)
-                self.logger.info(f"Found TCP flow to migrate: {flow_info['ipv4_src']}:{flow_info['tcp_src']} -> {flow_info['ipv4_dst']}:{flow_info['tcp_dst']}")
+                self.logger.debug(f"Found TCP flow to migrate: {flow_info['ipv4_src']}:{flow_info['tcp_src']} -> {flow_info['ipv4_dst']}:{flow_info['tcp_dst']}")
 
         # Install migrated flows on alternative path
         self._install_migrated_flows()
@@ -377,7 +385,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         s2_dp = self.datapaths.get(2)
 
         if not all([s1_dp, s4_dp, s2_dp]):
-            self.logger.warning("Cannot install migrated flows: switches not ready")
+            self.logger.error("Cannot install migrated flows: switches not ready")
             return
 
         for flow in self.flows_to_migrate:
@@ -457,7 +465,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
             actions = [s1_dp.ofproto_parser.OFPActionOutput(1)]  # to h1
             self.add_flow(s1_dp, 1, match, actions)
 
-        self.logger.info(f"Installed {len(self.flows_to_migrate)} flows on alternative path s1->s4->s2")
+        self.logger.debug(f"Installed {len(self.flows_to_migrate)} flows on alternative path s1->s4->s2")
 
     def _delete_flows_from_optimal_path(self):
         """Delete migrated TCP flows from optimal path switches"""
@@ -513,7 +521,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
                 )
                 dp.send_msg(mod)
 
-        self.logger.info(f"Deleted {len(self.flows_to_migrate)} flows from optimal path (s1, s3, s2)")
+        self.logger.debug(f"Deleted {len(self.flows_to_migrate)} flows from optimal path (s1, s3, s2)")
 
     def install_voip_path(self, pkt, src_mac, dst_mac, datapath, in_port):
         """Install VoIP flows on optimal path bidirectionally"""
@@ -524,7 +532,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         s2_dp = self.datapaths.get(2)
 
         if not all([s1_dp, s3_dp, s2_dp]):
-            self.logger.warning("Cannot install VoIP path: switches not ready yet")
+            self.logger.error("Cannot install VoIP path: switches not ready yet")
             return
 
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
@@ -700,7 +708,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         )
         s1_dp.send_msg(mod)
 
-        self.logger.info(f"VoIP path installed bidirectionally (detected: {direction}) with 5s idle timeout")
+        self.logger.info(f"VoIP path installed bidirectionally (detected from: {direction})")
 
     def block_nonvoip_on_optimal_path(self):
         """Block non-VoIP traffic from using optimal path s1->s3->s2 and setup alternative path"""
@@ -764,7 +772,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         actions = [s2_dp.ofproto_parser.OFPActionOutput(3)]  # to s4
         self.add_flow(s2_dp, priority, match, actions)
 
-        self.logger.info("Non-VoIP traffic redirected to alternative path s1->s4->s2")
+        self.logger.debug("Non-VoIP traffic redirected to alternative path s1->s4->s2")
 
     @set_ev_cls(stplib.EventPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -786,7 +794,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
         self.mac_to_port.setdefault(dpid, {})
 
         # Learn MAC address
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+        self.logger.debug("packet in %s %s %s %s", dpid, src, dst, in_port)
         self.mac_to_port[dpid][src] = in_port
 
         # Check for VoIP and install optimal path
@@ -796,7 +804,7 @@ class STP_Switch(simple_switch_stp_13.SimpleSwitch13):
 
             # First VoIP packet - setup optimal path
             if not self.voip_active:
-                self.logger.info("VoIP detected! Installing optimal path")
+                self.logger.warning("VoIP detected! Installing optimal path")
                 self.voip_active = True
                 self.migrate_tcp_flows_to_alternative_path()
                 self.install_voip_path(pkt, src, dst, datapath, in_port)
